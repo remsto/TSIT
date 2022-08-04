@@ -132,23 +132,12 @@ vkitti_train_transform = et.ExtCompose([
                     std=[0.229, 0.224, 0.225]),
 ])
 
-
-
-vkitti_val_transform_deeplab = et.ExtCompose([
-    # et.ExtResize( 512 ),
-    #et.ExtResize((188, 620)),
-    #et.ExtToTensor(),
-    et.ExtNormalize(mean=[0.485, 0.456, 0.406],
-                    std=[0.229, 0.224, 0.225]),
-])
-
-
-vkitti_val_transform_TSIT = et.ExtCompose([
+vkitti_val_transform = et.ExtCompose([
     # et.ExtResize( 512 ),
     et.ExtResize((188, 620)),
     et.ExtToTensor(),
-    et.ExtNormalize(mean=[0.5, 0.5, 0.5],
-                    std=[0.5, 0.5, 0.5]),
+    et.ExtNormalize(mean=[0.485, 0.456, 0.406],
+                    std=[0.229, 0.224, 0.225]),
 ])
 
 
@@ -172,9 +161,9 @@ kitti_val_transform = et.ExtCompose([
                     std=[0.229, 0.224, 0.225]),
 ])
 
-val_ds_kitti = Kitti('DeepLabV3Plus_Pytorch/datasets/data/kitti', split='val', transform=vkitti_val_transform_TSIT)
+val_ds_kitti = Kitti('DeepLabV3Plus_Pytorch/datasets/data/kitti', split='val', transform=kitti_val_transform)
 val_loader_kitti = datatorch.DataLoader(val_ds_kitti, batch_size=1, shuffle=True, num_workers=2)
-val_ds_vkitti = Vkitti('DeepLabV3Plus_Pytorch/datasets/data/vkitti', split='val', transform=vkitti_val_transform_TSIT)
+val_ds_vkitti = Vkitti('DeepLabV3Plus_Pytorch/datasets/data/vkitti', split='val', transform=vkitti_val_transform)
 val_loader_vkitti = datatorch.DataLoader(val_ds_vkitti, batch_size=1, shuffle=True, num_workers=2)
 
 def max_with_threshold(seg_pred):
@@ -201,93 +190,41 @@ def compute_miou(pred, truth):
 metrics = StreamSegMetrics(11)
 
 
-for epoch in tqdm(iter_counter.training_epochs()):
-    iter_counter.record_epoch_start(epoch)
-    for i, data_i in enumerate(tqdm(dataloader), start=iter_counter.epoch_iter):
-        iter_counter.record_one_iteration()
-        # Training
-        # train generator
-        if i % opt.D_steps_per_G == 0:
-            trainer.run_generator_one_step(data_i)
 
-        # train discriminator
-        trainer.run_discriminator_one_step(data_i)
+metrics.reset()
+for (image_kitti, label_kitti), (image_vkitti, label_vkitti) in zip(val_loader_kitti, val_loader_vkitti):
+    transform_to_tensor = transforms.Compose([transforms.PILToTensor()])
+    print("VOICI TYPE", type(image_kitti), type(image_vkitti))
+    image_kitti_val = F.pad(image_kitti, (0, 0, 0, 432, 0, 0, 0, 0), mode='constant', value=0)
+    image_vkitti_val = F.pad(image_vkitti, (0, 0, 0, 432, 0, 0, 0, 0), mode='constant', value=0)
+    print("VOICI SIZE", image_kitti_val.size(), image_vkitti_val.size())
+    data_val = {
+        'label' : image_vkitti_val,
+        'instance' : 0,
+        'image' :image_kitti_val,
+        'path' : 0,
+        'cpath' : 0
+    }
+    trainer.run_generator_one_step(data_val)
+    input = trainer.get_latest_generated()[0]
+    input = torch.unsqueeze(input, 0)
+    print('INPUT', input.size())
+    seg_pred = model_seg(tff.crop(input, 0, 0, 188, 620))
+    output = seg_pred.detach().max(dim=1)[1].cpu().numpy()
+    # seg_pred = torch.softmax(seg_pred, dim=1)
+    # print('VOICI LE SOFTMAX', seg_pred[0, :, 0, 0], sum(seg_pred[0, :, 0, 0]))
+    seg_probs, seg_preds = torch.max(seg_pred, dim=1)
+    threshold_seg = 255.0
+    jaccard = JaccardIndex(num_classes=11)
 
-        # Visualizations
-        if iter_counter.needs_printing():
-            losses = trainer.get_latest_losses()
-            visualizer.print_current_errors(epoch, iter_counter.epoch_iter,
-                                            losses, iter_counter.time_per_iter)
-            visualizer.plot_current_errors(losses, iter_counter.total_steps_so_far)
-
-        if iter_counter.needs_displaying():
-            if opt.task == 'SIS':
-                visuals = OrderedDict([('input_label', data_i['label'][0]),
-                                       ('synthesized_image', trainer.get_latest_generated()[0]),
-                                       ('real_image', data_i['image'][0])])
-            else:
-                visuals = OrderedDict([('content', data_i['label'][0]),
-                                       ('synthesized_image', trainer.get_latest_generated()[0]),
-                                       ('style', data_i['image'][0])])
-            visualizer.display_current_results(visuals, epoch, iter_counter.total_steps_so_far)
-
-        if iter_counter.needs_saving():
-            print('saving the latest model (epoch %d, total_steps %d)' %
-                  (epoch, iter_counter.total_steps_so_far))
-            trainer.save('latest')
-            iter_counter.record_current_iter()
-        if i % seg_step == 0:
-            metrics.reset()
-            for (image_kitti, label_kitti), (image_vkitti, label_vkitti) in zip(val_loader_kitti, val_loader_vkitti):
-                transform_to_tensor = transforms.Compose([transforms.PILToTensor()])
-                print("VOICI TYPE", type(image_kitti), type(image_vkitti))
-                image_kitti_val = F.pad(image_kitti, (0, 0, 0, 432, 0, 0, 0, 0), mode='constant', value=0)
-                image_vkitti_val = F.pad(image_vkitti, (0, 0, 0, 432, 0, 0, 0, 0), mode='constant', value=0)
-                print("VOICI SIZE", image_kitti_val.size(), image_vkitti_val.size())
-                data_val = {
-                    'label' : image_vkitti_val,
-                    'instance' : 0,
-                    'image' :image_kitti_val,
-                    'path' : 0,
-                    'cpath' : 0
-                }
-                save_image(image_kitti_val, 'image_kitti_val.png')
-                trainer.run_generator_one_step(data_val)
-                input = trainer.get_latest_generated()
-                save_image(input[0], 'input.png')
-                print('----------------------------------------------------------------')
-                print('check ->', input.size(), input.max(), input.min())
-                input=input[0].mul(255).add_(0.5).clamp_(0, 255)
-                print('check 1 before normalization->',input.size(),input.max(),input.min())
-                input=input/255.0
-                print('INPUT 0', input.size())
-                input,_=vkitti_val_transform_deeplab(input,label_kitti)
-                print('INPUT 1', input.size())
-                input = torch.unsqueeze(input, 0)
-                print('check 2 after normalization ->',input.size(),input.max(),input.min())
-                seg_pred = model_seg(tff.crop(input, 0, 0, 188, 620))
-                output = seg_pred.detach().max(dim=1)[1].cpu().numpy()
-                # seg_pred = torch.softmax(seg_pred, dim=1)
-                # print('VOICI LE SOFTMAX', seg_pred[0, :, 0, 0], sum(seg_pred[0, :, 0, 0]))
-                seg_probs, seg_preds = torch.max(seg_pred, dim=1)
-                threshold_seg = 255.0
-
-                seg_preds_cap = torch.where(seg_probs > 0.9, seg_preds, torch.full(seg_preds.size(), 255).cuda())
-                save_image(torch.mul(seg_preds_cap, 1/11), 'wohaha.png')
-                metrics.update(label_kitti.cpu().numpy(), output)
-                print('VOICI LE MIOU', metrics.get_results())
-                print('MIOU MAISON', compute_miou(output, label_kitti.cpu().numpy()))
-                break
-
-
-    trainer.update_learning_rate(epoch)
-    iter_counter.record_epoch_end()
-
-    if epoch % opt.save_epoch_freq == 0 or \
-       epoch == iter_counter.total_epochs:
-        print('saving the model at the end of epoch %d, iters %d' %
-              (epoch, iter_counter.total_steps_so_far))
-        trainer.save('latest')
-        trainer.save(epoch)
+    seg_preds_cap = torch.where(seg_probs > 0.9, seg_preds, torch.full(seg_preds.size(), 255).cuda())
+    save_image(torch.mul(seg_preds_cap, 1/11), 'wohaha.png')
+    metrics.update(label_kitti.cpu().numpy(), output)
+    print('MIOU MAISON', compute_miou(output, label_kitti.cpu().numpy()))
+    print('SIZE JACCARD', label_kitti.size(), seg_pred.detach().max(dim=1)[1].size())
+    #break
 
 print('Training was successfully finished.')
+print('VOICI LE MIOU', metrics.get_results())
+
+

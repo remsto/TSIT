@@ -31,6 +31,9 @@ class CustomDataset(Pix2pixDataset):
         label_dir = opt.label_dir
         label_paths = make_dataset(label_dir, recursive=False, read_cache=True)
 
+        segmap_dir = opt.segmap_dir
+        segmap_paths = make_dataset(segmap_dir, recursive=False, read_cache=True)
+
         image_dir = opt.image_dir
         image_paths = make_dataset(image_dir, recursive=False, read_cache=True)
 
@@ -40,8 +43,10 @@ class CustomDataset(Pix2pixDataset):
         else:
             instance_paths = []
 
-        label_paths = random.sample(label_paths,len(image_paths))
+        random_indexes = random.sample([i for i in range(len(segmap_paths))], len(image_paths))
+        label_paths_filt = [label_paths[i] for i in random_indexes]
+        segmap_paths_filt = [segmap_paths[i] for i in random_indexes]
 
-        assert len(label_paths) == len(image_paths), "The #images in %s and %s do not match. Is there something wrong?"
+        assert len(label_paths_filt) == len(image_paths), "The #images in %s and %s do not match. Is there something wrong?"
 
-        return label_paths, image_paths, instance_paths
+        return label_paths_filt, image_paths, instance_paths, segmap_paths_filt

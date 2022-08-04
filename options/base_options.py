@@ -35,6 +35,7 @@ class BaseOptions():
         parser.add_argument('--label_nc', type=int, default=3, help='# of input label classes without unknown class. If you have unknown class as class label, specify --contain_dopntcare_label.')
         parser.add_argument('--contain_dontcare_label', action='store_true', help='if the label map contains dontcare label (dontcare=255)')
         parser.add_argument('--output_nc', type=int, default=3, help='# of output image channels')
+        parser.add_argument('--nc_spade_label', type=int, default=3, help='number of label channel')
 
         # for setting inputs
         parser.add_argument('--dataset_mode', type=str, default='summer2winteryosemite')
@@ -59,6 +60,7 @@ class BaseOptions():
         parser.add_argument('--z_dim', type=int, default=256, help="dimension of the latent z vector")
         parser.add_argument('--alpha', type=float, default=1.0, help='The parameter that controls the degree of stylization (between 0 and 1)')
         parser.add_argument('--no_ss', action='store_true', help='discard the style stream (better results in certain cases).')
+        parser.add_argument('--nb_bins', type=int, default=40, help='number of bins for the depth spade')
 
         # for instance-wise features
         parser.add_argument('--no_instance', action='store_true', help='if specified, do *not* add instance map as input')

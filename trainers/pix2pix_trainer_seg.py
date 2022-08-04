@@ -1,7 +1,11 @@
 from models.networks.sync_batchnorm import DataParallelWithCallback
 from models.pix2pix_model import Pix2PixModel
 from DeepLabV3Plus_Pytorch import network, utils
+import torch
+import torchvision.transforms.functional as tff
 
+criterion = torch.nn.CrossEntropyLoss(ignore_index=255, reduction='mean')
+alpha = 1.0
 
 class Pix2PixTrainer():
     """
@@ -26,12 +30,27 @@ class Pix2PixTrainer():
                 self.pix2pix_model_on_one_gpu.create_optimizers(opt)
             self.old_lr = opt.lr
 
-    def run_generator_one_step(self, data):
+    def run_generator_one_step(self, data, model_seg, transform_seg):
         self.optimizer_G.zero_grad()
         g_losses, generated = self.pix2pix_model(data, mode='generator')
-        g_loss = sum(g_losses.values()).mean()
+
+
+        input = generated[0].mul(255).add_(0.5).clamp_(0, 255)/255
+        input, _ = transform_seg(input, None)
+        input = torch.unsqueeze(input, 0)
+        seg_output = model_seg(tff.crop(data['label'], 0, 0, 188, 620))
+        seg_output = torch.softmax(seg_output, dim=1)
+        seg_probs, seg_preds = torch.max(seg_output, dim=1)
+        seg_pseudo = torch.where(seg_probs > 0.9, seg_preds, torch.full(seg_preds.size(), 255).cuda())
+        seg_pred = model_seg(tff.crop(input, 0, 0, 188, 620))
+        seg_loss = criterion(seg_pred, seg_pseudo)
+        with open('seg_loss_reset_without_G_matched_spadefade_bins_one_hotted_k30.log','a') as seg_losslog:
+            seg_losslog.write(str(seg_loss.item())+'\n')
+        g_loss = (1-alpha)*(sum(g_losses.values()).mean()) + alpha*seg_loss
         g_loss.backward()
         self.optimizer_G.step()
+        self.seg_pseudo = seg_pseudo
+        _, self.seg_pred = torch.max(seg_pred, dim=1)
         self.g_losses = g_losses
         self.generated = generated
 

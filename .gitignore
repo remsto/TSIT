@@ -18,10 +18,16 @@ datasets/photo2art
 datasets/Cityscapes
 datasets/ADEChallengeData2016
 datasets/kitti
+datasets/kitti_depth
 datasets/vkitti
 models/networks/sync_batchnorm
 results*
 srun_scripts
+perfs.md
+*.log
+val_depth_sample.txt
+script*
+DeepLabV3Plus_Pytorch
 
 .isort.cfg
 .pre-commit-config.yaml

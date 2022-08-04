@@ -198,6 +198,13 @@ def load_network(net, label, epoch, opt):
     save_filename = '%s_net_%s.pth' % (epoch, label)
     save_dir = os.path.join(opt.checkpoints_dir, opt.name)
     save_path = os.path.join(save_dir, save_filename)
+    print(save_path)
+
+    # A enlever
+    # save_path_hardcoded = '/home/demeter/workspace_remiG/TSIT/checkpoints/ast_vkitti2kitti_lr_by_10/180_net_G.pth'
+    # if label=='G':
+    #     weights = torch.load(save_path_hardcoded)
+    # else:
     weights = torch.load(save_path)
     net.load_state_dict(weights)
     return net

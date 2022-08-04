@@ -4,18 +4,19 @@ from PIL import Image
 # from cv2 import threshold
 
 import data
+from data.base_dataset import BaseDataset, get_params, get_transform
 from DeepLabV3Plus_Pytorch.datasets.kitti import Kitti
 from DeepLabV3Plus_Pytorch.datasets.vkitti import Vkitti
 from options.train_options import TrainOptions
 from util.iter_counter import IterationCounter
 from util.visualizer import Visualizer
-from trainers.pix2pix_trainer import Pix2PixTrainer
+from trainers.pix2pix_trainer_seg import Pix2PixTrainer
 from tqdm import tqdm
 from DeepLabV3Plus_Pytorch import network, utils, datasets
 from torch.utils import data as datatorch
 from DeepLabV3Plus_Pytorch.metrics import StreamSegMetrics
-from torchmetrics import JaccardIndex
 from DeepLabV3Plus_Pytorch.utils import ext_transforms as et
+from skimage.exposure import match_histograms
 import torch
 import torch.nn.functional as F
 import os
@@ -25,66 +26,18 @@ import numpy as np
 import torchvision.transforms as transforms
 
 
-def jaccard_loss(true, logits, eps=1e-7):
-    """Computes the Jaccard loss, a.k.a the IoU loss.
-    Note that PyTorch optimizers minimize a loss. In this
-    case, we would like to maximize the jaccard loss so we
-    return the negated jaccard loss.
-    Args:
-        true: a tensor of shape [B, H, W] or [B, 1, H, W].
-        logits: a tensor of shape [B, C, H, W]. Corresponds to
-            the raw output or logits of the model.
-        eps: added to the denominator for numerical stability.
-    Returns:
-        jacc_loss: the Jaccard loss.
-    """
-    num_classes = logits.shape[1]
-    if num_classes == 1:
-        true_1_hot = torch.eye(num_classes + 1)[true.squeeze(1)]
-        true_1_hot = true_1_hot.permute(0, 3, 1, 2).float()
-        true_1_hot_f = true_1_hot[:, 0:1, :, :]
-        true_1_hot_s = true_1_hot[:, 1:2, :, :]
-        true_1_hot = torch.cat([true_1_hot_s, true_1_hot_f], dim=1)
-        pos_prob = torch.sigmoid(logits)
-        neg_prob = 1 - pos_prob
-        probas = torch.cat([pos_prob, neg_prob], dim=1)
-    else:
-        true_1_hot = torch.eye(num_classes)[true.squeeze(1)]
-        true_1_hot = true_1_hot.permute(0, 3, 1, 2).float()
-        probas = F.softmax(logits, dim=1)
-    true_1_hot = true_1_hot.type(logits.type())
-    dims = (0,) + tuple(range(2, true.ndimension()))
-    intersection = torch.sum(probas * true_1_hot, dims)
-    cardinality = torch.sum(probas + true_1_hot, dims)
-    union = cardinality - intersection
-    jacc_loss = (intersection / (union + eps)).mean()
-    return (1 - jacc_loss)
 
-def validate(model_seg, model_tsit, kitti_loader, vkitti_loader, device, metrics, ret_samples_ids=None):
-    """Do validation and return specified samples"""
-    metrics.reset()
-    ret_samples = []
+def save_labels(pseudo, preds, epoch, iter, name):
+    pseudo_arr = (torch.squeeze(pseudo).cpu().numpy().astype('uint8'))*23
+    preds_arr = (torch.squeeze(preds).cpu().numpy().astype('uint8'))*23
+    image_arr = np.concatenate((pseudo_arr, np.full((30, 620), 255, dtype=np.uint8), preds_arr), axis=0)
+    image = Image.fromarray(image_arr, mode='L')
+    image.save('checkpoints/{}/seg_preds/epoch{}_iter{}.png'.format(name, epoch, iter))
 
-    with torch.no_grad():
-        for i, ((kitti_images, kitti_labels), (vkitti_images, vkitti_labels)) in tqdm(enumerate(zip(kitti_loader, vkitti_loader))):
-            images = images.to(device, dtype=torch.float32)
-            labels = labels.to(device, dtype=torch.long)
-
-            kitti_to_vkitti_image = model_tsit(kitti_images)
-
-            outputs = model_seg(images)
-            preds = outputs.detach().max(dim=1)[1].cpu().numpy()
-            targets = labels.cpu().numpy()
-
-            metrics.update(targets, preds)
-            if ret_samples_ids is not None and i in ret_samples_ids:  # get vis samples
-                ret_samples.append(
-                    (images[0].detach().cpu().numpy(), targets[0], preds[0]))
-
-        score = metrics.get_results()
-    return score, ret_samples
 
 crop_size = 188
+best_miou = 0.0
+best_miou_matched = 0.0
 
 # parse options
 opt = TrainOptions().parse()
@@ -92,27 +45,23 @@ opt = TrainOptions().parse()
 print(' '.join(sys.argv))
 
 # load the dataset
-print('DEBUT DATALOADER')
 dataloader = data.create_dataloader(opt)
-print('FIN DATALOADER')
 
 # create trainer for our model
-print('DEBUT NETWWORK')
 trainer = Pix2PixTrainer(opt)
+
+# Create the Semantic Segmentation Model (DeeplabV3Plus)
 seg_model = 0
 ckpt='/home/demeter/workspace_remiG/DeepLabV3Plus_Pytorch/saved_checkpoints/best_deeplabv3plus_resnet50_vkitti_os16_best.pth'
-seg_step = 100
+seg_step = 200
 model_seg = network.modeling.__dict__['deeplabv3plus_resnet50'](num_classes=11, output_stride=16)
-# network.convert_to_separable_conv(model_seg.classifier)
 utils.set_bn_momentum(model_seg.backbone, momentum=0.01)
 device = torch.device('cuda')
-print("ISFILE", os.path.isfile(ckpt))
 checkpoint = torch.load(ckpt, map_location=torch.device('cpu'))
 model_seg.load_state_dict(checkpoint["model_state"])
 model_seg = torch.nn.DataParallel(model_seg)
 model_seg.to(device)
 model_seg.eval()
-print('FIN NETWORK')
 
 # create tool for counting iterations
 iter_counter = IterationCounter(opt, len(dataloader))
@@ -120,7 +69,7 @@ iter_counter = IterationCounter(opt, len(dataloader))
 # create tool for visualization
 visualizer = Visualizer(opt)
 
-
+# Transforms
 vkitti_train_transform = et.ExtCompose([
     # et.ExtResize( 512 ),
     et.ExtResize((188, 620)),
@@ -172,33 +121,15 @@ kitti_val_transform = et.ExtCompose([
                     std=[0.229, 0.224, 0.225]),
 ])
 
-val_ds_kitti = Kitti('DeepLabV3Plus_Pytorch/datasets/data/kitti', split='val', transform=vkitti_val_transform_TSIT)
+transform_depth_val = get_transform(opt, {'crop_pos': (0, 0), 'flip': False}, normalize=False, toTensor=False, toPILTensor=True)
+
+val_ds_kitti = Kitti('./datasets/kitti_depth', split='val', transform=vkitti_val_transform_TSIT, depth=True)
 val_loader_kitti = datatorch.DataLoader(val_ds_kitti, batch_size=1, shuffle=True, num_workers=2)
-val_ds_vkitti = Vkitti('DeepLabV3Plus_Pytorch/datasets/data/vkitti', split='val', transform=vkitti_val_transform_TSIT)
+val_ds_vkitti = Vkitti('DeepLabV3Plus_Pytorch/datasets/data/vkitti', split='val', transform=vkitti_val_transform_TSIT, keep_all_id=True)
 val_loader_vkitti = datatorch.DataLoader(val_ds_vkitti, batch_size=1, shuffle=True, num_workers=2)
 
-def max_with_threshold(seg_pred):
-    seg_pred = torch.softmax(seg_pred, dim=1)
-    seg_probs, seg_preds = torch.max(seg_pred, dim=1)
-
-def compute_miou(pred, truth):
-    inter_list = [0 for _ in range(11)]
-    union_list = [0 for _ in range(11)]
-    for y in range(pred.shape[1]):
-        for x in range(pred.shape[2]):
-            p = pred[0, y, x]
-            t = truth[0, y, x]
-            if p != 255 and t != 255:
-                if p == t:
-                    union_list[t] += 1
-                    inter_list[p] += 1
-                else:
-                    union_list[t] += 1
-                    union_list[p] += 1
-    miou_list = [inter_list[i]/union_list[i] if union_list[i] != 0 else np.NaN for i in range(11)]
-    return np.nansum(miou_list)/sum(~np.isnan(miou_list)), miou_list
-
 metrics = StreamSegMetrics(11)
+metrics_matched = StreamSegMetrics(11)
 
 
 for epoch in tqdm(iter_counter.training_epochs()):
@@ -208,7 +139,7 @@ for epoch in tqdm(iter_counter.training_epochs()):
         # Training
         # train generator
         if i % opt.D_steps_per_G == 0:
-            trainer.run_generator_one_step(data_i)
+            trainer.run_generator_one_step(data_i, model_seg, vkitti_val_transform_deeplab)
 
         # train discriminator
         trainer.run_discriminator_one_step(data_i)
@@ -220,7 +151,7 @@ for epoch in tqdm(iter_counter.training_epochs()):
                                             losses, iter_counter.time_per_iter)
             visualizer.plot_current_errors(losses, iter_counter.total_steps_so_far)
 
-        if iter_counter.needs_displaying():
+        if iter_counter.needs_displaying() or i==0:
             if opt.task == 'SIS':
                 visuals = OrderedDict([('input_label', data_i['label'][0]),
                                        ('synthesized_image', trainer.get_latest_generated()[0]),
@@ -229,7 +160,10 @@ for epoch in tqdm(iter_counter.training_epochs()):
                 visuals = OrderedDict([('content', data_i['label'][0]),
                                        ('synthesized_image', trainer.get_latest_generated()[0]),
                                        ('style', data_i['image'][0])])
+                visuals_seg = OrderedDict([('seg_pseudo', trainer.seg_pseudo),
+                                            ('seg_pred', trainer.seg_pred)])
             visualizer.display_current_results(visuals, epoch, iter_counter.total_steps_so_far)
+            save_labels(trainer.seg_pseudo, trainer.seg_pred, epoch, iter_counter.total_steps_so_far, opt.name)
 
         if iter_counter.needs_saving():
             print('saving the latest model (epoch %d, total_steps %d)' %
@@ -238,46 +172,71 @@ for epoch in tqdm(iter_counter.training_epochs()):
             iter_counter.record_current_iter()
         if i % seg_step == 0:
             metrics.reset()
-            for (image_kitti, label_kitti), (image_vkitti, label_vkitti) in zip(val_loader_kitti, val_loader_vkitti):
-                transform_to_tensor = transforms.Compose([transforms.PILToTensor()])
-                print("VOICI TYPE", type(image_kitti), type(image_vkitti))
-                image_kitti_val = F.pad(image_kitti, (0, 0, 0, 432, 0, 0, 0, 0), mode='constant', value=0)
-                image_vkitti_val = F.pad(image_vkitti, (0, 0, 0, 432, 0, 0, 0, 0), mode='constant', value=0)
-                print("VOICI SIZE", image_kitti_val.size(), image_vkitti_val.size())
+            metrics_matched.reset()
+            for (image_kitti, label_kitti, depth_kitti_path), (image_vkitti, label_vkitti) in zip(val_loader_kitti, val_loader_vkitti):
+                depth_kitti = Image.open(depth_kitti_path[0])
+                image_kitti_val = F.pad(image_kitti, (0, 0, 0, 432, 0, 0, 0, 0), mode='constant', value=-1.0)
+                image_vkitti_val = F.pad(image_vkitti, (0, 0, 0, 432, 0, 0, 0, 0), mode='constant', value=-1.0)
+
+                depth_kitti_val = transform_depth_val(depth_kitti)
+                depth_kitti_val = torch.unsqueeze(depth_kitti_val, 0)
+                label_vkitti_val = F.pad(torch.unsqueeze(label_vkitti, 0), (0, 0, 0, 432, 0, 0, 0, 0), mode='constant', value=0).float()
+
+                min_tensor = depth_kitti_val.min()
+                depth_kitti_val = depth_kitti_val.add(-min_tensor + 1.0)
+                q = torch.log(depth_kitti_val.max())/opt.nb_bins
+                depth_kitti_val = depth_kitti_val.log().mul(1/q).round()
+
+                segmap_tensor_remi_transform = torch.nn.functional.one_hot(depth_kitti_val.to(torch.int64), opt.nb_bins+1)
+                segmap_tensor_remi_transform = torch.squeeze(segmap_tensor_remi_transform)
+                segmap_tensor_remi_transform = torch.permute(segmap_tensor_remi_transform, (2, 0, 1)).to(torch.float)
+                segmap_tensor_remi_transform = torch.unsqueeze(segmap_tensor_remi_transform, 0)
+
                 data_val = {
-                    'label' : image_vkitti_val,
+                    'label' : image_kitti_val,
                     'instance' : 0,
-                    'image' :image_kitti_val,
+                    'segmap' :  segmap_tensor_remi_transform,
+                    'image' :image_vkitti_val,
                     'path' : 0,
                     'cpath' : 0
                 }
-                save_image(image_kitti_val, 'image_kitti_val.png')
-                trainer.run_generator_one_step(data_val)
-                input = trainer.get_latest_generated()
-                save_image(input[0], 'input.png')
-                print('----------------------------------------------------------------')
-                print('check ->', input.size(), input.max(), input.min())
-                input=input[0].mul(255).add_(0.5).clamp_(0, 255)
-                print('check 1 before normalization->',input.size(),input.max(),input.min())
-                input=input/255.0
-                print('INPUT 0', input.size())
+
+                # get transformed image from TSIT
+                _, input = trainer.pix2pix_model(data_val, mode='generator')
+
+                # data preparation for DeepLab
+                input=input[0].mul(255).add_(0.5).clamp_(0, 255)/255
                 input,_=vkitti_val_transform_deeplab(input,label_kitti)
-                print('INPUT 1', input.size())
                 input = torch.unsqueeze(input, 0)
-                print('check 2 after normalization ->',input.size(),input.max(),input.min())
+                input_array = tff.crop(input, 0, 0, 188, 620).detach().cpu().numpy()
+                input_matched = torch.from_numpy(match_histograms(input_array, image_vkitti.cpu().numpy())).float()
+
+                # get outputs from DeepLab
                 seg_pred = model_seg(tff.crop(input, 0, 0, 188, 620))
+                seg_pred_matched = model_seg(input_matched)
                 output = seg_pred.detach().max(dim=1)[1].cpu().numpy()
-                # seg_pred = torch.softmax(seg_pred, dim=1)
-                # print('VOICI LE SOFTMAX', seg_pred[0, :, 0, 0], sum(seg_pred[0, :, 0, 0]))
+                output_matched = seg_pred_matched.detach().max(dim=1)[1].cpu().numpy()
                 seg_probs, seg_preds = torch.max(seg_pred, dim=1)
                 threshold_seg = 255.0
 
                 seg_preds_cap = torch.where(seg_probs > 0.9, seg_preds, torch.full(seg_preds.size(), 255).cuda())
-                save_image(torch.mul(seg_preds_cap, 1/11), 'wohaha.png')
                 metrics.update(label_kitti.cpu().numpy(), output)
-                print('VOICI LE MIOU', metrics.get_results())
-                print('MIOU MAISON', compute_miou(output, label_kitti.cpu().numpy()))
-                break
+                metrics_matched.update(label_kitti.cpu().numpy(), output_matched)
+                print('Scores : ', metrics.get_results())
+                print('Scores with histogram matching', metrics_matched.get_results())
+            print('Final scores', metrics.get_results())
+            print('Final scores with histogram matching', metrics_matched.get_results())
+
+            # saving the best models
+            if metrics.get_results()['Mean IoU'] > best_miou:
+                best_miou = metrics.get_results()['Mean IoU']
+                trainer.save('best_without_match_spadefade_bins_one_hotted_k30')
+            if metrics_matched.get_results()['Mean IoU'] > best_miou_matched:
+                best_miou_matched = metrics_matched.get_results()['Mean IoU']
+                trainer.save('best_with_match_spadefade_bins_one_hotted_k30')
+            print('Best scores (without hist matching, with hist matching)', best_miou, best_miou_matched)
+            with open('miou_without_G_matched_spadefade_bins_one_hotted_k30.log','a') as mioulog:
+                mioulog.write('{}     {}   \n'.format(metrics.get_results()['Mean IoU'], metrics_matched.get_results()['Mean IoU']))
 
 
     trainer.update_learning_rate(epoch)

@@ -1,7 +1,20 @@
+from cmath import log
+from re import S
 from data.base_dataset import BaseDataset, get_params, get_transform
 from PIL import Image
 import util.util as util
 import os
+import torch
+import numpy as np
+import torchvision.transforms as transforms
+
+def save_depths(groundtruth: torch.Tensor, gt_bins: torch.Tensor, q, epoch, iter, name) -> None:
+    depth_kitti_val = (gt_bins.mul(q) + gt_bins.add(1).mul(q)).mul(1/2)
+    groundtruth_val = groundtruth.add(-groundtruth.min()).mul(255/(groundtruth.max()-groundtruth.min())).round()
+    tensor_to_save = torch.cat(( gt_bins.mul(255/gt_bins.max()).round(),groundtruth_val, depth_kitti_val.mul(255/depth_kitti_val.max()).round()), dim=2)
+    topil = transforms.ToPILImage()
+    img_to_save: Image.Image = topil(tensor_to_save)
+    img_to_save.save('checkpoints/{}/seg_preds/epoch{}_iter{}_depth.png'.format(name, epoch, iter))
 
 
 class Pix2pixDataset(BaseDataset):
@@ -13,8 +26,9 @@ class Pix2pixDataset(BaseDataset):
 
     def initialize(self, opt):
         self.opt = opt
+        self.iter = 0
 
-        label_paths, image_paths, instance_paths = self.get_paths(opt)
+        label_paths, image_paths, instance_paths, segmap_paths = self.get_paths(opt)
 
         util.natural_sort(label_paths)
         util.natural_sort(image_paths)
@@ -33,6 +47,7 @@ class Pix2pixDataset(BaseDataset):
         self.label_paths = label_paths
         self.image_paths = image_paths
         self.instance_paths = instance_paths
+        self.segmap_paths = segmap_paths
 
         size = len(self.label_paths)
         self.dataset_size = size
@@ -52,6 +67,10 @@ class Pix2pixDataset(BaseDataset):
     def __getitem__(self, index):
         # Label (Content) Image
         label_path = self.label_paths[index]
+
+        segmap_path = self.segmap_paths[index]
+        label_path = os.path.join('./datasets/kitti/', segmap_path.split('/')[3], segmap_path.split('/')[4], 'image_02/data', segmap_path.split('/')[8])
+
         label = Image.open(label_path)
         if self.opt.task != 'SIS':
             label = label.convert('RGB')
@@ -65,8 +84,28 @@ class Pix2pixDataset(BaseDataset):
             label_tensor = transform_label(label) * 255.0
             label_tensor[label_tensor == 255] = self.opt.label_nc  # 'unknown' is opt.label_nc
 
+        # Segmap
+        segmap = Image.open(segmap_path)        
+        transform_segmap = get_transform(self.opt, params, method=Image.BICUBIC, normalize=False, toTensor=False, toPILTensor=True)
+        segmap_tensor_gt = transform_segmap(segmap).float()
+        min_tensor = segmap_tensor_gt.min()
+        segmap_tensor = segmap_tensor_gt.add(-min_tensor + 1.0)
+        q = torch.log(segmap_tensor.max())/self.opt.nb_bins
+        segmap_tensor = segmap_tensor.log().mul(1/q).round()
+
+        if self.iter % 500 == 0:
+            save_depths(segmap_tensor_gt, segmap_tensor, q, 'epoch', self.iter, self.opt.name)
+
+        segmap_tensor_remi_transform = torch.nn.functional.one_hot(segmap_tensor.to(torch.int64), self.opt.nb_bins+1)
+        segmap_tensor_remi_transform = torch.squeeze(segmap_tensor_remi_transform)
+        segmap_tensor_remi_transform = torch.permute(segmap_tensor_remi_transform, (2, 0, 1)).to(torch.float)
+
+
         # Real (Style) Image
         image_path = self.image_paths[index]
+
+        # Commented line because unaligned datasets
+
         # assert self.paths_match(label_path, image_path), \
         #     "The label_path %s and image_path %s don't match." % \
         #     (label_path, image_path)
@@ -90,13 +129,18 @@ class Pix2pixDataset(BaseDataset):
 
         input_dict = {'label': label_tensor,
                       'instance': instance_tensor,
+                      'segmap': segmap_tensor_remi_transform,
                       'image': image_tensor,
                       'path': image_path,
                       'cpath': label_path
                       }
 
+
+
         # Give subclasses a chance to modify the final output
         self.postprocess(input_dict)
+        
+        self.iter += 1
 
         return input_dict
 

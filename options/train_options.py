@@ -23,6 +23,8 @@ class TrainOptions(BaseOptions):
         parser.add_argument('--beta2', type=float, default=0.999, help='momentum term of adam')
         parser.add_argument('--lr', type=float, default=0.0002, help='initial learning rate for adam')
         parser.add_argument('--D_steps_per_G', type=int, default=1, help='number of discriminator iterations per generator iterations.')
+        parser.add_argument('--alpha_seg', type=float, default=0.5, help='alpha for weighting the segmentation loss')
+        parser.add_argument('--segmap_dir', type=str, help='directory for segmap')
 
         # for discriminators
         parser.add_argument('--ndf', type=int, default=64, help='# of discrim filters in first conv layer')

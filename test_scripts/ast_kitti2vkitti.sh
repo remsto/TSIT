@@ -2,14 +2,14 @@
 
 set -x
 
-NAME='ast_vkitti2kitti_lr_times_10'
+NAME='ast_vkitti2kitti_lr_by_10'
 TASK='AST'
 DATA='custom'
-CROOT='../dataset/cycleGan/testB'
-SROOT='../dataset/cycleGan/testA'
+CROOT='../dataset/kitti2vkitti_depth/testB'
+SROOT='../dataset/kitti2vkitti_depth/testA'
 CKPTROOT='./checkpoints'
 WORKER=4
-RESROOT='./results'
+RESROOT='./results/depth'
 EPOCH=$1
 PREPROCESS='scale_width_and_crop'
 LOADSIZE=620
@@ -20,7 +20,7 @@ ASPECTRATIO=1
 python test.py \
     --name $NAME \
     --task $TASK \
-    --gpu_ids 3 \
+    --gpu_ids 2 \
     --checkpoints_dir $CKPTROOT \
     --batchSize 1 \
     --dataset_mode $DATA \
